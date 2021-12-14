@@ -11,11 +11,15 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <stdio.h>
+#include <sched.h>
+#include <fcntl.h>
 
 #include "banking.h"
 #include "ipc.h"
 #include "pa2345.h"
 #include "common.h"
+
+int receive_blocking(void* self, local_id id, Message* msg);
 
 typedef int pipe_fd;
 typedef struct {
@@ -44,7 +48,7 @@ typedef struct {
 // FIXME Add defines for release functions masks
 
 // FIXME maybe use getopt
-int get_process_count(const int argc, const char** argv, int* p_count, balance_t** balances) {
+static int process_args(const int argc, const char** argv, int* p_count, balance_t** balances) {
     char* endptr = "\0";
 
     int i;
@@ -60,6 +64,7 @@ int get_process_count(const int argc, const char** argv, int* p_count, balance_t
         return -endptr[0];
     }
 
+    i++;
     if ((argc - i) < (*p_count - 1)) {
         return 1;
     }
@@ -131,6 +136,16 @@ int release_pipes(int mask, ...) {
     return -mask;
 }
 
+static int nonblocking_fd(int fd) {
+    int cur_flag = fcntl(fd, F_GETFL);
+
+    if (cur_flag == -1 || fcntl(fd, F_SETFL, cur_flag | O_NONBLOCK) != 0) {
+        return -1;
+    } else {
+        return 0;
+    }
+}
+
 int prepare_pipes(uint8_t p_count, channel** all_channels, FILE* const log_file) {
     uint32_t cross_p = p_count * p_count;
     *all_channels = calloc(cross_p, sizeof(channel));
@@ -144,10 +159,13 @@ int prepare_pipes(uint8_t p_count, channel** all_channels, FILE* const log_file)
             if (i == j) continue;
             else {
                 pipe_fd tuple[2];
-                // TODO Add making non-block
                 if (pipe(tuple) < 0) {
                     return release_pipes(0x02, k, all_channels, log_file);
                 } else {
+                    if (nonblocking_fd(tuple[0]) || nonblocking_fd(tuple[1])) {
+                        return release_pipes(0x02, k, all_channels, log_file);
+                    }
+
                     (*all_channels)[k].in_pipe = tuple[0];
                     (*all_channels)[k].out_pipe = tuple[1];
 
@@ -162,7 +180,8 @@ void attach_pipes(process_info* proc, channel** all_channels) {
     for (int i = 0; i < proc->p_count; i++) {
         proc->channels[i].in_pipe = (*all_channels)[proc->id * proc->p_count + i].in_pipe;
         proc->channels[i].out_pipe = (*all_channels)[proc->id + proc->p_count * i].out_pipe;
-        // marking these channels not to close
+
+        // marking these channels not to close them later
         (*all_channels)[proc->id * proc->p_count + i].in_pipe = -1;
         (*all_channels)[proc->id + proc->p_count * i].out_pipe = -1;
     }
@@ -264,8 +283,7 @@ int sync_states(process_info* proc, MessageType state) {
         if (i == proc->id) continue;
 
         Message msg;
-        // TODO Add receive blocking
-        if (receive(proc, i, &msg) < 0) {
+        if (receive_blocking(proc, i, &msg) > 0) {
             fprintf(stderr, "%d, Error on syncing %d\n", proc->id, state);
             return release_task(0x02, &proc->channels, proc->log_file, (int) proc->p_count);
         }
@@ -274,8 +292,6 @@ int sync_states(process_info* proc, MessageType state) {
 
     return 0;
 }
-
-void work(){}
 
 int task(process_info* proc) {
 
@@ -300,32 +316,106 @@ int task(process_info* proc) {
 
     write_log(proc->log_file, log_received_all_started_fmt, get_physical_time(), proc->id);
 
-    work();
+    int done = 1;
 
-    write_log(proc->log_file, log_done_fmt, proc->id);
+    BalanceHistory sub_history;
+    sub_history.s_id = proc->id;
+    sub_history.s_history_len = 0;
 
-    Message done_message = compose_message(
-            proc,
-            DONE,
-            log_done_fmt,
-            proc->id, proc->pid, proc->parent);
+    int is_working = 1;
+    while (is_working) {
+        Message msg;
 
-    if (send_multicast(proc, &done_message)) {
-        fprintf(stderr, "%d, Error on sending DONE\n", proc->id);
-        return release_task(0x03, proc->channels, proc->log_file, (int) proc->p_count);
+
+        // Receive any message
+        if (receive_any(proc, &msg) != 0)
+            return release_task(0x03, proc->channels, proc->log_file, (int) proc->p_count);
+
+        const timestamp_t time = get_physical_time();
+        // Fill balance history with timestamps
+        for (timestamp_t i = sub_history.s_history_len; i < time; ++i) {
+            sub_history.s_history[i].s_time = i;
+            sub_history.s_history[i].s_balance = proc->balance;
+            sub_history.s_history[i].s_balance_pending_in = 0;
+        }
+        sub_history.s_history_len = time;
+
+        TransferOrder* transfer;
+        switch (msg.s_header.s_type) {
+            case STOP:
+                // Current done is not checked?
+                ++done;
+
+                write_log(proc->log_file, log_done_fmt, get_physical_time(), proc->id, proc->balance);
+
+                Message done_message = compose_message(
+                        proc,
+                        DONE,
+                        log_done_fmt,
+                        get_physical_time(), proc->id, proc->balance);
+
+                if (send_multicast(proc, &done_message)) {
+                    fprintf(stderr, "%d, Error on sending DONE\n", proc->id);
+                    return release_task(0x04, proc->channels, proc->log_file, (int) proc->p_count);
+                }
+                break;
+
+            case DONE:
+                // Like syn_states but with state and non-blocking
+                ++done;
+                if (done == proc->p_count) {
+                    is_working = 0;
+                }
+                break;
+
+            case TRANSFER:
+                transfer = (TransferOrder*) msg.s_payload;
+                if (proc->id == transfer->s_src) {
+                    proc->balance -= transfer->s_amount;
+
+                    if (send(proc, transfer->s_dst, &msg) != 0) {
+                        return release_processes(0x03, proc->channels, proc->log_file, (int) proc->p_count);
+                    }
+
+                    write_log(proc->log_file, log_transfer_out_fmt, time, proc->id, transfer->s_amount, transfer->s_dst);
+                } else if (proc->id == transfer->s_dst) {
+                    write_log(proc->log_file, log_transfer_in_fmt, time, proc->id, transfer->s_amount, transfer->s_src);
+
+                    proc->balance += transfer->s_amount;
+
+                    Message ack;
+                    ack.s_header.s_magic = MESSAGE_MAGIC;
+                    ack.s_header.s_type = ACK;
+                    ack.s_header.s_payload_len = 0;
+
+                    if (send(proc, PARENT_ID, &ack) != 0)
+                        return release_processes(0x03, proc->channels, proc->log_file, (int) proc->p_count);
+                }
+                break;
+        }
     }
 
-    if (sync_states(proc, DONE)) {
-        fprintf(stderr, "%d, Error on syncing\n", proc->id);
-        return 4;
-    }
+    sub_history.s_history[sub_history.s_history_len].s_time = sub_history.s_history_len;
+    sub_history.s_history[sub_history.s_history_len].s_balance = proc->balance;
+    sub_history.s_history[sub_history.s_history_len].s_balance_pending_in = 0;
+    sub_history.s_history_len++;
 
-    write_log(proc->log_file, log_received_all_done_fmt, proc->id);
+    Message msg;
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    msg.s_header.s_type = BALANCE_HISTORY;
+    // offsetof = sizeof(1) + sizeof(2);
+    msg.s_header.s_payload_len = sizeof(BalanceState) * sub_history.s_history_len + offsetof(BalanceHistory, s_history) ;
+    memcpy(msg.s_payload, &sub_history, msg.s_header.s_payload_len);
+
+    if (send(proc, PARENT_ID, &msg) != 0)
+        return release_task(0x04, proc->channels, proc->log_file, (int) proc->p_count);
+
+    write_log(proc->log_file, log_received_all_done_fmt, get_physical_time(), proc->id);
 
     return 0;
 }
 
-int start_processes(process_info* parent, pid_t** child_pids,  int(*child_func)(process_info*)) {
+int start_processes(process_info* parent, pid_t** child_pids, const balance_t* balances, int(*child_func)(process_info*)) {
     *child_pids = calloc(parent->p_count, sizeof(pid_t));
 
     FILE* const events_file = fopen(events_log, "a+");
@@ -353,7 +443,8 @@ int start_processes(process_info* parent, pid_t** child_pids,  int(*child_func)(
                     parent->p_count,
                     (local_id) i,
                     calloc(parent->p_count, sizeof(channel)),
-                    events_file
+                    events_file,
+                    balances[i-1]
             };
 
             attach_pipes(&child_info, &all_channels);
@@ -372,10 +463,46 @@ int join_all(process_info* proc, pid_t* sub_processes) {
         fprintf(stderr, "%d, Error on syncing\n", proc->id);
         return 2;
     }
+
+    bank_robbery(proc, (local_id) (proc->p_count - 1));
+
+    Message msg;
+    msg.s_header.s_magic = MESSAGE_MAGIC;
+    msg.s_header.s_type = STOP;
+    msg.s_header.s_payload_len = 0;
+
+    if (send_multicast(proc, &msg) < 0) return 3;
+
+
     if (sync_states(proc, DONE)) {
         fprintf(stderr, "%d, Error on syncing\n", proc->id);
         return 4;
     }
+
+    AllHistory history;
+    history.s_history_len = proc->p_count - 1;
+
+    for (local_id id = 1; (uint8_t) id < proc->p_count; id++) {
+        Message data_msg;
+
+        if (receive_blocking(proc, id, &data_msg) > 0)
+            return 1;
+
+        if (data_msg.s_header.s_type != BALANCE_HISTORY)
+            return 1;
+
+        BalanceHistory* sub_history = (BalanceHistory*) data_msg.s_payload;
+
+        history.s_history[id-1].s_history_len = sub_history->s_history_len;
+        history.s_history[id-1].s_id = sub_history->s_id;
+
+        for (size_t i = 0; i < sub_history->s_history_len; i++) {
+            history.s_history[id-1].s_history[i] = sub_history->s_history[i];
+        }
+
+    }
+
+    print_history(&history);
 
     for (int i = 1; i < proc->p_count; i++) {
         if (waitpid(sub_processes[i], NULL, 0) < 0) {
@@ -396,7 +523,7 @@ int main(int argc, char* argv[]) {
     balance_t* balances;
 
     // Parse arguments (-p X a b c d ...)
-    int args_res = get_process_count(argc, (const char **) argv, &process_count, &balances);
+    int args_res = process_args(argc, (const char **) argv, &process_count, &balances);
 
     if(args_res != 0) {
         fprintf(stderr, "Failed to parse args");
@@ -420,18 +547,23 @@ int main(int argc, char* argv[]) {
             NULL
     };
     pid_t* child_pids;
-    if (start_processes(&parent, &child_pids, task)) {
+    if (start_processes(&parent, &child_pids, balances, task)) {
         fprintf(stderr, "Failed to create child-processes\n");
+        free(balances);
         return 1;
     }
 
     // Wait for the processes to finish
     if (join_all(&parent, child_pids)) {
-        fprintf(stderr, "Failed to create child-processes\n");
+        fprintf(stderr, "Failed to join child-processes\n");
+        free(balances);
+        free(child_pids);
         return 2;
     }
 
     // Exit
+    free(parent.channels);
+    free(balances);
     free(child_pids);
     return 0;
 }
@@ -440,7 +572,18 @@ static int send_all(int fd, const void* buf, size_t left){
     const char* ptr = buf;
     ssize_t sent;
 
-    while ((sent = write(fd, ptr, left)) >= 0) {
+    errno = 0;
+    for (;;) {
+        if ((sent = write(fd, ptr, left)) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                sched_yield();
+                continue;
+            }
+
+            fprintf(stderr, "Encountered a sending problem %s\n", strerror(errno));
+            break;
+        }
+
         left -= sent; ptr += sent;
 
         if (left == 0)
@@ -480,11 +623,33 @@ static int receive_full(int fd, void* buf, size_t left) {
     char* ptr = buf;
     ssize_t bytes_read;
 
-    while ((bytes_read = read(fd, ptr, left)) > 0) {
+    errno = 0;
+    for (;;) {
+        if ((bytes_read = read(fd, ptr, left)) < 0) {
+            if (ptr != buf && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                sched_yield();
+                continue;
+            }
+
+            if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
+                fprintf(stderr, "Encountered a receiving problem %d %s\n", errno, strerror(errno));
+            }
+            break;
+        }
+
         left -= bytes_read; ptr += bytes_read;
 
         if (left == 0)
             return (int) bytes_read;
+
+        if (bytes_read == 0) {
+            if (errno == 0) {
+                errno = EAGAIN;
+            }
+
+            break;
+        }
+
     }
 
     return -1;
@@ -493,29 +658,85 @@ static int receive_full(int fd, void* buf, size_t left) {
 int receive(void* self, local_id from, Message* msg){
     process_info* proc = self;
 
+    // Non-blocking ask for header
     if (receive_full(proc->channels[from].in_pipe, &(msg->s_header), sizeof(MessageHeader)) < 0) {
-        fprintf(stderr, "Failed to receive header: %s\n", strerror(errno));
         return 1;
     }
 
+    // Blocking ask for finishing body
+    while (receive_full(proc->channels[from].in_pipe, msg->s_payload, msg->s_header.s_payload_len) < 0) {
+        if (errno == EWOULDBLOCK || errno == EAGAIN) {
+            sched_yield();
+            continue;
+        }
 
-    if (receive_full(proc->channels[from].in_pipe, msg->s_payload, msg->s_header.s_payload_len) < 0) {
-        fprintf(stderr, "Failed to receive body: %s\n", strerror(errno));
         return 2;
     }
 
     return 0;
 }
 
+int receive_blocking(void* self, local_id id, Message * msg) {
+//    process_info* proc = self;
+
+    for (;;) {
+        int ret = receive( self, id, msg);
+
+        if (ret != 0 && (errno == EWOULDBLOCK || errno == EAGAIN)){
+            sched_yield();
+            continue;
+        }
+
+        return ret;
+    }
+}
+
 int receive_any(void* self, Message* msg){
     process_info* proc = self;
 
-    while(1) {
+    for(;;) {
         for (local_id i = 0; i < proc->p_count; i++) {
             if (i == proc->id) continue;
 
             if (!receive(proc, i, msg)) return 0;
+
+            if (errno != EAGAIN || errno != EWOULDBLOCK) {
+                fprintf(stderr, "ERROR in receive_any %s\n", strerror(errno));
+                return -1;
+            }
+
         }
+        sched_yield();
     }
 
+}
+
+void transfer(void* parent_data, local_id src, local_id dst, balance_t amount) {
+    process_info* proc = parent_data;
+
+    if (proc->id == PARENT_ID) {
+        Message msg;
+
+        msg.s_header.s_magic = MESSAGE_MAGIC;
+        msg.s_header.s_type = TRANSFER;
+        msg.s_header.s_payload_len = sizeof(TransferOrder);
+
+        TransferOrder* transfer = (TransferOrder *) msg.s_payload;
+        transfer->s_src = src;
+        transfer->s_dst = dst;
+        transfer->s_amount = amount;
+
+        send(parent_data, src, &msg);
+
+        receive_blocking(parent_data, dst, &msg);
+
+        if (msg.s_header.s_type != ACK) {
+            fprintf(stderr, "Received non ACK type on confirmation (from %d)\n", dst);
+            exit(1);
+        }
+
+    } else {
+        fprintf(stderr, "Transfer was called by child %d\n", proc->id);
+        exit(1);
+    }
 }
