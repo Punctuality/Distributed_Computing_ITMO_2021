@@ -139,11 +139,10 @@ int release_pipes(int mask, ...) {
 static int nonblocking_fd(int fd) {
     int cur_flag = fcntl(fd, F_GETFL);
 
-    if (cur_flag == -1 || fcntl(fd, F_SETFL, cur_flag | O_NONBLOCK) != 0) {
+    if (cur_flag == -1 || fcntl(fd, F_SETFL, cur_flag | O_NONBLOCK) != 0)
         return -1;
-    } else {
+    else
         return 0;
-    }
 }
 
 int prepare_pipes(uint8_t p_count, channel** all_channels, FILE* const log_file) {
@@ -317,7 +316,6 @@ int task(process_info* proc) {
     write_log(proc->log_file, log_received_all_started_fmt, get_physical_time(), proc->id);
 
     int done = 1;
-
     BalanceHistory sub_history;
     sub_history.s_id = proc->id;
     sub_history.s_history_len = 0;
@@ -326,24 +324,23 @@ int task(process_info* proc) {
     while (is_working) {
         Message msg;
 
-
         // Receive any message
         if (receive_any(proc, &msg) != 0)
             return release_task(0x03, proc->channels, proc->log_file, (int) proc->p_count);
 
         const timestamp_t time = get_physical_time();
-        // Fill balance history with timestamps
         for (timestamp_t i = sub_history.s_history_len; i < time; ++i) {
-            sub_history.s_history[i].s_time = i;
-            sub_history.s_history[i].s_balance = proc->balance;
-            sub_history.s_history[i].s_balance_pending_in = 0;
+            BalanceState* cur_bs = sub_history.s_history + i;
+            cur_bs->s_time = i;
+            cur_bs->s_balance = proc->balance;
+
+            cur_bs->s_balance_pending_in = 0;
         }
         sub_history.s_history_len = time;
 
         TransferOrder* transfer;
         switch (msg.s_header.s_type) {
             case STOP:
-                // Current done is not checked?
                 ++done;
 
                 write_log(proc->log_file, log_done_fmt, get_physical_time(), proc->id, proc->balance);
@@ -361,11 +358,10 @@ int task(process_info* proc) {
                 break;
 
             case DONE:
-                // Like syn_states but with state and non-blocking
+                // Like sync_states but with state and non-blocking
                 ++done;
-                if (done == proc->p_count) {
+                if (done == proc->p_count)
                     is_working = 0;
-                }
                 break;
 
             case TRANSFER:
@@ -373,20 +369,16 @@ int task(process_info* proc) {
                 if (proc->id == transfer->s_src) {
                     proc->balance -= transfer->s_amount;
 
-                    if (send(proc, transfer->s_dst, &msg) != 0) {
+                    if (send(proc, transfer->s_dst, &msg) != 0)
                         return release_processes(0x03, proc->channels, proc->log_file, (int) proc->p_count);
-                    }
 
                     write_log(proc->log_file, log_transfer_out_fmt, time, proc->id, transfer->s_amount, transfer->s_dst);
                 } else if (proc->id == transfer->s_dst) {
-                    write_log(proc->log_file, log_transfer_in_fmt, time, proc->id, transfer->s_amount, transfer->s_src);
-
                     proc->balance += transfer->s_amount;
 
-                    Message ack;
-                    ack.s_header.s_magic = MESSAGE_MAGIC;
-                    ack.s_header.s_type = ACK;
-                    ack.s_header.s_payload_len = 0;
+                    write_log(proc->log_file, log_transfer_in_fmt, time, proc->id, transfer->s_amount, transfer->s_src);
+
+                    Message ack = compose_message(proc,ACK,"");
 
                     if (send(proc, PARENT_ID, &ack) != 0)
                         return release_processes(0x03, proc->channels, proc->log_file, (int) proc->p_count);
@@ -400,11 +392,9 @@ int task(process_info* proc) {
     sub_history.s_history[sub_history.s_history_len].s_balance_pending_in = 0;
     sub_history.s_history_len++;
 
-    Message msg;
-    msg.s_header.s_magic = MESSAGE_MAGIC;
-    msg.s_header.s_type = BALANCE_HISTORY;
-    // offsetof = sizeof(1) + sizeof(2);
-    msg.s_header.s_payload_len = sizeof(BalanceState) * sub_history.s_history_len + offsetof(BalanceHistory, s_history) ;
+    Message msg = compose_message(proc, BALANCE_HISTORY, "");
+    // offsetof = local_id + uint8_t;
+    msg.s_header.s_payload_len = offsetof(BalanceHistory, s_history) + sizeof(BalanceState) * sub_history.s_history_len;
     memcpy(msg.s_payload, &sub_history, msg.s_header.s_payload_len);
 
     if (send(proc, PARENT_ID, &msg) != 0)
@@ -458,7 +448,7 @@ int start_processes(process_info* parent, pid_t** child_pids, const balance_t* b
     return 0;
 }
 
-int join_all(process_info* proc, pid_t* sub_processes) {
+int parent_work(process_info* proc, pid_t* sub_processes) {
     if (sync_states(proc, STARTED)) {
         fprintf(stderr, "%d, Error on syncing\n", proc->id);
         return 2;
@@ -466,13 +456,9 @@ int join_all(process_info* proc, pid_t* sub_processes) {
 
     bank_robbery(proc, (local_id) (proc->p_count - 1));
 
-    Message msg;
-    msg.s_header.s_magic = MESSAGE_MAGIC;
-    msg.s_header.s_type = STOP;
-    msg.s_header.s_payload_len = 0;
+    Message msg = compose_message(proc, STOP, "");
 
     if (send_multicast(proc, &msg) < 0) return 3;
-
 
     if (sync_states(proc, DONE)) {
         fprintf(stderr, "%d, Error on syncing\n", proc->id);
@@ -481,7 +467,6 @@ int join_all(process_info* proc, pid_t* sub_processes) {
 
     AllHistory history;
     history.s_history_len = proc->p_count - 1;
-
     for (local_id id = 1; (uint8_t) id < proc->p_count; id++) {
         Message data_msg;
 
@@ -491,29 +476,28 @@ int join_all(process_info* proc, pid_t* sub_processes) {
         if (data_msg.s_header.s_type != BALANCE_HISTORY)
             return 1;
 
-        BalanceHistory* sub_history = (BalanceHistory*) data_msg.s_payload;
+        BalanceHistory* sub_history = history.s_history + (id - 1);
+        BalanceHistory* msg_history = (BalanceHistory*) data_msg.s_payload;
 
-        history.s_history[id-1].s_history_len = sub_history->s_history_len;
-        history.s_history[id-1].s_id = sub_history->s_id;
+        sub_history->s_history_len = msg_history->s_history_len;
+        sub_history->s_id = msg_history->s_id;
 
-        for (size_t i = 0; i < sub_history->s_history_len; i++) {
-            history.s_history[id-1].s_history[i] = sub_history->s_history[i];
-        }
-
+//        For some reason memcpy doesn't work
+//        memcpy(sub_history->s_history, msg_history->s_history, msg_history->s_history_len);
+        for (size_t i = 0; i < sub_history->s_history_len; i++)
+            sub_history->s_history[i] = msg_history->s_history[i];
     }
 
     print_history(&history);
+    return 0;
+}
 
-    for (int i = 1; i < proc->p_count; i++) {
+int join_all(process_info* proc, pid_t* sub_processes) {
+    for (int i = 1; i < proc->p_count; i++)
         if (waitpid(sub_processes[i], NULL, 0) < 0) {
-            if (errno == ECHILD) {
-                return 0;
-            } else {
-                return 1;
-            }
+            if (errno == ECHILD) return 0;
+            else return 1;
         }
-    }
-
     return 0;
 }
 
@@ -554,11 +538,17 @@ int main(int argc, char* argv[]) {
     }
 
     // Wait for the processes to finish
+    if (parent_work(&parent, child_pids)) {
+        fprintf(stderr, "Failed to execute main thread\n");
+        return 2;
+    }
+
+    // Wait for the processes to finish
     if (join_all(&parent, child_pids)) {
         fprintf(stderr, "Failed to join child-processes\n");
         free(balances);
         free(child_pids);
-        return 2;
+        return 3;
     }
 
     // Exit
@@ -568,13 +558,15 @@ int main(int argc, char* argv[]) {
     return 0;
 }
 
+// Implementation of interop
+
 static int send_all(int fd, const void* buf, size_t left){
-    const char* ptr = buf;
-    ssize_t sent;
+    const char* ptr = buf; ssize_t sent;
 
     errno = 0;
     for (;;) {
         if ((sent = write(fd, ptr, left)) < 0) {
+            // That's all the errors I found
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
                 sched_yield();
                 continue;
@@ -631,9 +623,11 @@ static int receive_full(int fd, void* buf, size_t left) {
                 continue;
             }
 
-            if (!(errno == EAGAIN || errno == EWOULDBLOCK)) {
-                fprintf(stderr, "Encountered a receiving problem %d %s\n", errno, strerror(errno));
-            }
+            if (!(errno == EAGAIN || errno == EWOULDBLOCK))
+                fprintf(stderr,
+                        "Encountered a receiving problem %d %s\n",
+                        errno,
+                        strerror(errno));
             break;
         }
 
@@ -659,11 +653,10 @@ int receive(void* self, local_id from, Message* msg){
     process_info* proc = self;
 
     // Non-blocking ask for header
-    if (receive_full(proc->channels[from].in_pipe, &(msg->s_header), sizeof(MessageHeader)) < 0) {
+    if (receive_full(proc->channels[from].in_pipe, &(msg->s_header), sizeof(MessageHeader)) < 0)
         return 1;
-    }
 
-    // Blocking ask for finishing body
+    // Blocking ask for finishing body (this code executes, only when there's a message to accept)
     while (receive_full(proc->channels[from].in_pipe, msg->s_payload, msg->s_header.s_payload_len) < 0) {
         if (errno == EWOULDBLOCK || errno == EAGAIN) {
             sched_yield();
@@ -677,8 +670,6 @@ int receive(void* self, local_id from, Message* msg){
 }
 
 int receive_blocking(void* self, local_id id, Message * msg) {
-//    process_info* proc = self;
-
     for (;;) {
         int ret = receive( self, id, msg);
 
@@ -704,30 +695,20 @@ int receive_any(void* self, Message* msg){
                 fprintf(stderr, "ERROR in receive_any %s\n", strerror(errno));
                 return -1;
             }
-
+            sched_yield();
         }
-        sched_yield();
     }
-
 }
 
 void transfer(void* parent_data, local_id src, local_id dst, balance_t amount) {
     process_info* proc = parent_data;
 
     if (proc->id == PARENT_ID) {
-        Message msg;
-
-        msg.s_header.s_magic = MESSAGE_MAGIC;
-        msg.s_header.s_type = TRANSFER;
+        Message msg = compose_message(proc, TRANSFER, "");
         msg.s_header.s_payload_len = sizeof(TransferOrder);
-
-        TransferOrder* transfer = (TransferOrder *) msg.s_payload;
-        transfer->s_src = src;
-        transfer->s_dst = dst;
-        transfer->s_amount = amount;
+        *((TransferOrder*) msg.s_payload) = (TransferOrder) {src, dst, amount };
 
         send(parent_data, src, &msg);
-
         receive_blocking(parent_data, dst, &msg);
 
         if (msg.s_header.s_type != ACK) {
