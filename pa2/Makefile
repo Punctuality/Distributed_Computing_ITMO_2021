@@ -3,10 +3,12 @@
 all: a.out
 
 run_context: all
-	export LD_LIBRARY_PATH="$(shell pwd -P):$LD_LIBRARY_PATH"
+	export LD_LIBRARY_PATH="$(shell pwd -P)"
 	export LD_PRELOAD="$(shell pwd -P)/libruntime.so"
 
-run: run_context
+run: all
+	export LD_LIBRARY_PATH="$(shell pwd -P)"
+	export LD_PRELOAD="$(shell pwd -P)/libruntime.so"
 	./a.out -p 2 10 20
 
 clean:
