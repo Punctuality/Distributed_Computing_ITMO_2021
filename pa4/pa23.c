@@ -18,9 +18,19 @@
 #include "ipc.h"
 #include "pa2345.h"
 #include "common.h"
+#include "request_queue.h"
 
 #define max(x, y) \
         (x > y ? x : y)
+
+#define mutex(proc, cs_block)     \
+    if (proc->do_sync)            \
+        if (request_cs(proc) < 0) \
+            return -1;            \
+    {cs_block}                    \
+    if (proc->do_sync)            \
+        if (release_cs(proc) < 0) \
+            return -1;
 
 int receive_blocking(void* self, local_id id, Message* msg);
 
@@ -37,6 +47,9 @@ typedef struct {
     // Global state info
     uint8_t p_count;
     local_id id;
+    int start;
+    int reply;
+    int done;
 
     // IPC
     channel* channels;
@@ -44,8 +57,9 @@ typedef struct {
     // We can't use shared memory, therefore...
     FILE* const log_file;
 
-    // Task specific
-    balance_t balance;
+    // CS specific
+    int do_sync;
+    request_queue queue;
 } process_info;
 // Should've been placed in proc, but due to function def, need to improvise with static variables (fork() copies them)
 timestamp_t current_time = 0;
@@ -59,38 +73,24 @@ void time_step() {
 // FIXME Add defines for release functions masks
 
 // FIXME maybe use getopt
-static int process_args(const int argc, const char** argv, int* p_count, balance_t** balances) {
+static int process_args(const int argc, const char** argv, int* p_count, int* do_sync) {
     char* endptr = "\0";
 
     int i;
-    for(i = 1; i < argc; i++) {
+    for(i = 1; i < argc; i++)
         if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
             i++;
             *p_count = (int) strtol(argv[i], &endptr, 10) + 1;
             break;
         }
-    }
 
-    if (strcmp(endptr, "\0") != 0) {
+    if (strcmp(endptr, "\0") != 0)
         return -endptr[0];
-    }
 
-    i++;
-    if ((argc - i) < (*p_count - 1)) {
-        return 1;
-    }
-
-    *balances = calloc(*p_count - 1, sizeof(balance_t));
-    if (!*balances) {
-        return 2;
-    }
-
-    for(int j = 0; j < (*p_count - 1); j++, i++) {
-        (*balances)[j] = (balance_t) strtol(argv[i], &endptr, 10);
-        if (strcmp(endptr, "\0") != 0) {
-            return -endptr[0];
-        }
-    }
+    *do_sync = 0;
+    for (i = 1; i < argc; ++i)
+        if (strcmp("--mutexl", argv[i]) == 0)
+            *do_sync = 1;
 
     return 0;
 }
@@ -297,7 +297,34 @@ int sync_states(process_info* proc, MessageType state) {
             fprintf(stderr, "%d, Error on syncing %d\n", proc->id, state);
             return release_task(0x02, &proc->channels, proc->log_file, (int) proc->p_count);
         }
-        if (msg.s_header.s_type != state) return 1;
+        switch (msg.s_header.s_type) {
+            case CS_REQUEST:
+            case CS_RELEASE:
+                i--;
+                break;
+            default:
+                if (msg.s_header.s_type != state) return 1;
+        }
+    }
+
+    return 0;
+}
+
+int child_ipc(process_info* proc) {
+    Message msg;
+    local_id src = (local_id) receive_any(proc, &msg);
+
+    if (src < 0) return src;
+
+    switch (msg.s_header.s_type) {
+        case STARTED: proc->start++; break;
+        case DONE: proc->done++; break;
+        case CS_REPLY: proc->reply++; break;
+        case CS_RELEASE: q_delete(&proc->queue, src); break;
+        case CS_REQUEST:
+            q_push(&proc->queue, src, msg.s_header.s_local_time);
+            msg = compose_message(proc, CS_REPLY, "");
+            if (send(proc, src, &msg) < 0) return -2;
     }
 
     return 0;
@@ -305,121 +332,78 @@ int sync_states(process_info* proc, MessageType state) {
 
 int task(process_info* proc) {
 
+    // Starting
+
     write_log(proc->log_file,log_started_fmt,
-            get_lamport_time(), proc->id, proc->pid, proc->parent, proc->balance);
+            get_lamport_time(), proc->id, proc->pid, proc->parent, 0);
 
     Message start_message = compose_message(
             proc,
             STARTED,
             log_started_fmt,
-            get_lamport_time(), proc->id, proc->pid, proc->parent, proc->balance);
+            get_lamport_time(), proc->id, proc->pid, proc->parent, 0);
 
     if (send_multicast(proc, &start_message)) {
         fprintf(stderr, "%d, Error on sending STARTED\n", proc->id);
         return release_task(0x01, proc->channels, proc->log_file, (int) proc->p_count);
     }
 
-    if (sync_states(proc, STARTED)) {
-        fprintf(stderr, "%d, Error on syncing\n", proc->id);
-        return 2;
-    }
+    while (proc->start < (proc->p_count - 2))
+        if (child_ipc(proc))
+            return release_task(0x02, &proc->channels, proc->log_file, (int) proc->p_count);
 
     write_log(proc->log_file, log_received_all_started_fmt, get_lamport_time(), proc->id);
 
-    int done = 1;
-    BalanceHistory sub_history;
-    sub_history.s_id = proc->id;
-    sub_history.s_history_len = 0;
+    // STARTED
 
-    int is_working = 1;
-    while (is_working) {
-        Message msg;
+    // Working
 
-        // Receive any message
-        if (receive_any(proc, &msg) != 0)
-            return release_task(0x03, proc->channels, proc->log_file, (int) proc->p_count);
+    int print_times = proc->id * 5;
 
-        const timestamp_t time = get_lamport_time();
-        for (timestamp_t i = sub_history.s_history_len; i < time; ++i) {
-            BalanceState* cur_bs = sub_history.s_history + i;
-            cur_bs->s_time = i;
-            cur_bs->s_balance = proc->balance;
-
-            cur_bs->s_balance_pending_in = 0;
-        }
-        sub_history.s_history_len = time;
-
-        TransferOrder* transfer;
-        switch (msg.s_header.s_type) {
-            case STOP:
-                ++done;
-
-                write_log(proc->log_file, log_done_fmt, get_lamport_time(), proc->id, proc->balance);
-
-                Message done_message = compose_message(
-                        proc,
-                        DONE,
-                        log_done_fmt,
-                        get_lamport_time(), proc->id, proc->balance);
-
-                if (send_multicast(proc, &done_message)) {
-                    fprintf(stderr, "%d, Error on sending DONE\n", proc->id);
-                    return release_task(0x04, proc->channels, proc->log_file, (int) proc->p_count);
-                }
-                break;
-
-            case DONE:
-                // Like sync_states but with state and non-blocking
-                ++done;
-                if (done == proc->p_count)
-                    is_working = 0;
-                break;
-
-            case TRANSFER:
-                transfer = (TransferOrder*) msg.s_payload;
-                if (proc->id == transfer->s_src) {
-                    proc->balance -= transfer->s_amount;
-
-                    if (send(proc, transfer->s_dst, &msg) != 0)
-                        return release_processes(0x03, proc->channels, proc->log_file, (int) proc->p_count);
-
-                    write_log(proc->log_file, log_transfer_out_fmt, time, proc->id, transfer->s_amount, transfer->s_dst);
-                } else if (proc->id == transfer->s_dst) {
-                    write_log(proc->log_file, log_transfer_in_fmt, time, proc->id, transfer->s_amount, transfer->s_src);
-
-                    proc->balance += transfer->s_amount;
-
-                    for (timestamp_t i = msg.s_header.s_local_time - 1; i < time; i++)
-                        sub_history.s_history[i].s_balance_pending_in += transfer->s_amount;
-
-                    Message ack = compose_message(proc,ACK,"");
-
-                    if (send(proc, PARENT_ID, &ack) != 0)
-                        return release_processes(0x03, proc->channels, proc->log_file, (int) proc->p_count);
-                }
-                break;
-        }
+    char print_buf[128];
+    for (int i = 1; i < print_times + 1; i++) {
+        mutex(proc,
+              snprintf(
+                  print_buf,
+                  128,
+                  log_loop_operation_fmt,
+                  proc->id,
+                  i,
+                  print_times
+              );
+              print(print_buf);
+              )
     }
 
-    sub_history.s_history[sub_history.s_history_len].s_time = sub_history.s_history_len;
-    sub_history.s_history[sub_history.s_history_len].s_balance = proc->balance;
-    sub_history.s_history[sub_history.s_history_len].s_balance_pending_in = 0;
-    sub_history.s_history_len++;
+    // WORKED
 
-    Message msg = compose_message(proc, BALANCE_HISTORY, "");
-    // offsetof = local_id + uint8_t;
-    msg.s_header.s_payload_len = offsetof(BalanceHistory, s_history) + sizeof(BalanceState) * sub_history.s_history_len;
-    memcpy(msg.s_payload, &sub_history, msg.s_header.s_payload_len);
+    // Finishing
 
-    if (send(proc, PARENT_ID, &msg) != 0)
-        return release_task(0x04, proc->channels, proc->log_file, (int) proc->p_count);
+    write_log(proc->log_file, log_done_fmt, get_lamport_time(), proc->id, 0);
+
+    Message done_message = compose_message(
+            proc,
+            DONE,
+            log_done_fmt,
+            get_lamport_time(), proc->id, 0);
+
+    if (send_multicast(proc, &done_message)) {
+        fprintf(stderr, "%d, Error on sending DONE\n", proc->id);
+        return release_task(0x03, proc->channels, proc->log_file, (int) proc->p_count);
+    }
+
+    while (proc->done < (proc->p_count - 2))
+        if (child_ipc(proc))
+            return release_task(0x04, &proc->channels, proc->log_file, (int) proc->p_count);
 
     write_log(proc->log_file, log_received_all_done_fmt, get_lamport_time(), proc->id);
+
+    // Finished
 
     return 0;
 }
 
-int start_processes(process_info* parent, pid_t** child_pids, const balance_t* balances, int(*child_func)(process_info*)) {
+int start_processes(process_info* parent, pid_t** child_pids, const int do_sync, int(*child_func)(process_info*)) {
     *child_pids = calloc(parent->p_count, sizeof(pid_t));
 
     FILE* const events_file = fopen(events_log, "a+");
@@ -446,9 +430,11 @@ int start_processes(process_info* parent, pid_t** child_pids, const balance_t* b
                     parent->pid,
                     parent->p_count,
                     (local_id) i,
+                    0,0,0,
                     calloc(parent->p_count, sizeof(channel)),
                     events_file,
-                    balances[i-1]
+                    do_sync,
+                    (request_queue) { .size = 0 }
             };
 
             attach_pipes(&child_info, &all_channels);
@@ -463,46 +449,17 @@ int start_processes(process_info* parent, pid_t** child_pids, const balance_t* b
 }
 
 int parent_work(process_info* proc, pid_t* sub_processes) {
+    // TODO Check this sync states
     if (sync_states(proc, STARTED)) {
         fprintf(stderr, "%d, Error on syncing\n", proc->id);
         return 2;
     }
-
-    bank_robbery(proc, (local_id) (proc->p_count - 1));
-
-    Message msg = compose_message(proc, STOP, "");
-
-    if (send_multicast(proc, &msg) < 0) return 3;
 
     if (sync_states(proc, DONE)) {
         fprintf(stderr, "%d, Error on syncing\n", proc->id);
         return 4;
     }
 
-    AllHistory history;
-    history.s_history_len = proc->p_count - 1;
-    for (local_id id = 1; (uint8_t) id < proc->p_count; id++) {
-        Message data_msg;
-
-        if (receive_blocking(proc, id, &data_msg) > 0)
-            return 1;
-
-        if (data_msg.s_header.s_type != BALANCE_HISTORY)
-            return 1;
-
-        BalanceHistory* sub_history = history.s_history + (id - 1);
-        BalanceHistory* msg_history = (BalanceHistory*) data_msg.s_payload;
-
-        sub_history->s_history_len = msg_history->s_history_len;
-        sub_history->s_id = msg_history->s_id;
-
-//        For some reason memcpy doesn't work
-//        memcpy(sub_history->s_history, msg_history->s_history, msg_history->s_history_len);
-        for (size_t i = 0; i < sub_history->s_history_len; i++)
-            sub_history->s_history[i] = msg_history->s_history[i];
-    }
-
-    print_history(&history);
     return 0;
 }
 
@@ -516,12 +473,11 @@ int join_all(process_info* proc, pid_t* sub_processes) {
 }
 
 int main(int argc, char* argv[]) {
-
     int process_count;
-    balance_t* balances;
+    int do_sync;
 
-    // Parse arguments (-p X a b c d ...)
-    int args_res = process_args(argc, (const char **) argv, &process_count, &balances);
+    // Parse arguments (-p X [--mutexl])
+    int args_res = process_args(argc, (const char **) argv, &process_count, &do_sync);
 
     if(args_res != 0) {
         fprintf(stderr, "Failed to parse args");
@@ -541,13 +497,15 @@ int main(int argc, char* argv[]) {
             getpid(),
             (uint8_t) process_count,
             PARENT_ID,
+            0,0,0,
             calloc(process_count, sizeof(channel)),
-            NULL
+            NULL,
+            do_sync,
+            (request_queue) { .size = 0 }
     };
     pid_t* child_pids;
-    if (start_processes(&parent, &child_pids, balances, task)) {
+    if (start_processes(&parent, &child_pids, do_sync, task)) {
         fprintf(stderr, "Failed to create child-processes\n");
-        free(balances);
         return 1;
     }
 
@@ -560,14 +518,12 @@ int main(int argc, char* argv[]) {
     // Wait for the processes to finish
     if (join_all(&parent, child_pids)) {
         fprintf(stderr, "Failed to join child-processes\n");
-        free(balances);
         free(child_pids);
         return 3;
     }
 
     // Exit
     free(parent.channels);
-    free(balances);
     free(child_pids);
     return 0;
 }
@@ -725,7 +681,7 @@ int receive_any(void* self, Message* msg){
         for (local_id i = 0; i < proc->p_count; i++) {
             if (i == proc->id) continue;
 
-            if (!receive(proc, i, msg)) return 0;
+            if (!receive(proc, i, msg)) return i;
 
             if (errno != EAGAIN || errno != EWOULDBLOCK) {
                 fprintf(stderr, "ERROR in receive_any %s\n", strerror(errno));
@@ -736,24 +692,34 @@ int receive_any(void* self, Message* msg){
     }
 }
 
-void transfer(void* parent_data, local_id src, local_id dst, balance_t amount) {
-    process_info* proc = parent_data;
+int request_cs(const void* self) {
+    process_info* proc = (process_info*)  self;
+    Message msg = compose_message(proc, CS_REQUEST, "");
 
-    if (proc->id == PARENT_ID) {
-        Message msg = compose_message(proc, TRANSFER, "");
-        msg.s_header.s_payload_len = sizeof(TransferOrder);
-        *((TransferOrder*) msg.s_payload) = (TransferOrder) {src, dst, amount };
+    if (send_multicast(proc, &msg) != 0)
+        return 1;
 
-        send(parent_data, src, &msg);
-        receive_blocking(parent_data, dst, &msg);
+    proc->reply = 0;
+    q_push(&proc->queue, proc->id, get_lamport_time());
 
-        if (msg.s_header.s_type != ACK) {
-            fprintf(stderr, "Received non ACK type on confirmation (from %d)\n", dst);
-            exit(1);
-        }
+    // Live lock
+    while (proc->reply < (proc->p_count - 2) || proc->id != q_peek(&proc->queue))
+        if (child_ipc(proc))
+            return 1;
 
-    } else {
-        fprintf(stderr, "Transfer was called by child %d\n", proc->id);
-        exit(1);
+
+    return 0;
+}
+
+int release_cs(const void* self) {
+    process_info* proc = (process_info*) self;
+
+    if (q_peek(&proc->queue) != proc->id)
+        return -1;
+    else {
+        q_delete(&proc->queue, proc->id);
+
+        Message msg = compose_message(proc, CS_RELEASE, "");
+        return send_multicast(proc, &msg);
     }
 }

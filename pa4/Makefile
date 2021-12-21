@@ -14,7 +14,7 @@ clean:
 	rm -f events.log_msg
 	rm -f pipes.log_msg
 
-a.out: pa23.c bank_robbery.c
+a.out: pa23.c request_queue.c
 	$(CC) -o $@ -std=c99 -Wall -pedantic -g -O0 $^ $(CFLAGS) -L. -lruntime # -fsanitize=address
 
 %.c:
